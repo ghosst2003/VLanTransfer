@@ -26,6 +26,7 @@ export interface TransferState {
   transferred: number
   progress: number
   status: 'sending' | 'receiving' | 'done' | 'error'
+  direction?: 'in' | 'out'
 }
 
 export interface SignalMessage {
