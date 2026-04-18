@@ -456,8 +456,8 @@ export function useWebRTC(
     let offset = 0
 
     function waitForDrain(fn: () => void) {
-      if (channel.readyState !== 'open') return
-      if (channel.bufferedAmount <= BUFFER_THRESHOLD) {
+      if (channel!.readyState !== 'open') return
+      if (channel!.bufferedAmount <= BUFFER_THRESHOLD) {
         fn()
       } else {
         setTimeout(() => waitForDrain(fn), DRAIN_CHECK_MS)
@@ -467,8 +467,8 @@ export function useWebRTC(
     function sendNextChunk() {
       if (offset >= file.size) {
         waitForDrain(() => {
-          if (channel.readyState === 'open') {
-            channel.send(JSON.stringify({ msgType: 'file-end', fileId }))
+          if (channel!.readyState === 'open') {
+            channel!.send(JSON.stringify({ msgType: 'file-end', fileId }))
           }
           const transfer = transfers.value.get(fileId)
           if (transfer) transfer.status = 'done'
@@ -478,8 +478,8 @@ export function useWebRTC(
 
       const slice = file.slice(offset, offset + CHUNK_SIZE)
       slice.arrayBuffer().then((buffer) => {
-        if (channel.readyState !== 'open') return
-        channel.send(buffer)
+        if (channel!.readyState !== 'open') return
+        channel!.send(buffer)
         offset += CHUNK_SIZE
 
         const transfer = transfers.value.get(fileId)
