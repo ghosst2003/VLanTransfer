@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm create *)",
+      "Bash(npm install *)",
+      "Bash(yarn install *)",
+      "Bash(yarn add *)",
+      "Bash(npx vue-tsc *)",
+      "Bash(npx vite *)",
+      "Bash(node src/index.js)",
+      "Bash(git add *)"
+    ]
+  }
+}
