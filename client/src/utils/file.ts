@@ -1,14 +1,14 @@
 export const CHUNK_SIZE = 16 * 1024 // 16KB
 
-export function splitFile(file: File): ArrayBuffer[] {
+export async function splitFile(file: File): Promise<ArrayBuffer[]> {
   const chunks: ArrayBuffer[] = []
   let offset = 0
   while (offset < file.size) {
     const slice = file.slice(offset, offset + CHUNK_SIZE)
-    chunks.push(slice)
+    chunks.push(await slice.arrayBuffer())
     offset += CHUNK_SIZE
   }
-  return chunks as ArrayBuffer[]
+  return chunks
 }
 
 export function formatBytes(bytes: number): string {

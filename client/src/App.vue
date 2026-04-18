@@ -12,11 +12,15 @@ const deviceId = generateDeviceId()
 const deviceName = getDeviceName()
 
 const { isConnected, devices, connect, sendSignal } = useWebSocket()
-const { peers, messages, transfers, createPeer, handleSignal, sendMessage, sendFile } = useWebRTC()
+const { peers, messages, transfers, createPeer, handleSignal, sendMessage, sendFile } = useWebRTC(devices, sendSignal)
 
 const selectedDeviceId = ref<string | null>(null)
 const selectedDevice = computed(() => devices.value.find((d) => d.id === selectedDeviceId.value))
-const selectedPeer = computed(() => peers.value.get(selectedDeviceId.value ?? ''))
+const selectedPeerStatus = computed(() => {
+  if (!selectedDeviceId.value) return null
+  const peer = peers.value.get(selectedDeviceId.value)
+  return peer?.status ?? null
+})
 
 onMounted(() => {
   connect(deviceId, deviceName)
@@ -24,13 +28,21 @@ onMounted(() => {
   // Listen for incoming signals
   window.addEventListener('signal', ((e: CustomEvent) => {
     const { payload } = e.detail
-    handleSignal(payload.from as string, payload.data as Record<string, unknown>)
+    if (payload?.from && payload?.data) {
+      handleSignal(payload.from as string, payload.data as Record<string, unknown>)
+    }
   }) as EventListener)
 })
 
-function handleSelectDevice(deviceId: string) {
-  selectedDeviceId.value = deviceId
-  createPeer(devices.value.find((d) => d.id === deviceId)!)
+function handleSelectDevice(id: string) {
+  console.log('[App] Selected device:', id)
+  selectedDeviceId.value = id
+  const device = devices.value.find((d) => d.id === id)
+  if (device) {
+    createPeer(device)
+  } else {
+    console.error('[App] Device not found:', id)
+  }
 }
 
 function handleSendMessage(content: string) {
@@ -68,22 +80,25 @@ function handleSendFile(file: File) {
     <section v-if="selectedDevice" class="chat-section">
       <div class="chat-header">
         <h2>{{ selectedDevice.name }}</h2>
-        <span class="peer-status" :class="selectedPeer?.status">
-          {{ selectedPeer?.status === 'connected' ? 'Connected' : selectedPeer?.status === 'connecting' ? 'Connecting...' : 'Disconnected' }}
+        <span class="peer-status" :class="selectedPeerStatus">
+          {{ selectedPeerStatus === 'connected' ? 'Connected' : selectedPeerStatus === 'connecting' ? 'Connecting...' : 'Disconnected' }}
         </span>
       </div>
 
       <ChatPanel
         :messages="messages.get(selectedDeviceId!) || []"
-        :disabled="selectedPeer?.status !== 'connected'"
+        :disabled="selectedPeerStatus !== 'connected'"
         @send="handleSendMessage"
       />
 
       <FileTransfer
         :transfers="transfers"
-        :disabled="selectedPeer?.status !== 'connected'"
+        :disabled="selectedPeerStatus !== 'connected'"
         @send-file="handleSendFile"
       />
+    </section>
+    <section v-else class="empty-section">
+      <p class="empty-hint">点击左侧设备开始连接</p>
     </section>
   </main>
 </template>

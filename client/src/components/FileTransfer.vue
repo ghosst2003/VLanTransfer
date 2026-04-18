@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { ref } from 'vue'
 import { formatBytes } from '../utils/file'
 import type { TransferState } from '../types'
 
@@ -12,13 +11,12 @@ const emit = defineEmits<{
   sendFile: [file: File]
 }>()
 
-const fileInput = ref<HTMLInputElement | null>(null)
-
 function handleFileChange(e: Event) {
   const target = e.target as HTMLInputElement
-  const file = target.files?.[0]
-  if (file) {
-    emit('sendFile', file)
+  const files = target.files
+  if (files && files.length > 0) {
+    // Send each selected file
+    Array.from(files).forEach((file) => emit('sendFile', file))
     target.value = ''
   }
 }
@@ -28,10 +26,10 @@ function handleFileChange(e: Event) {
   <div class="file-transfer">
     <div class="transfer-header">
       <span class="transfer-title">文件传输</span>
-      <button class="send-btn" :disabled="disabled" @click="fileInput?.click()">
+      <label class="send-btn" :class="{ disabled }">
         发送文件
-      </button>
-      <input ref="fileInput" type="file" style="display: none" @change="handleFileChange" />
+        <input type="file" :disabled="disabled" @change="handleFileChange" />
+      </label>
     </div>
 
     <div class="transfer-list">
@@ -74,6 +72,8 @@ function handleFileChange(e: Event) {
 }
 
 .send-btn {
+  position: relative;
+  display: inline-block;
   padding: 6px 16px;
   background: var(--primary);
   color: white;
@@ -81,9 +81,17 @@ function handleFileChange(e: Event) {
   border-radius: 6px;
   font-size: 13px;
   cursor: pointer;
+  overflow: hidden;
 }
 
-.send-btn:disabled {
+.send-btn input[type="file"] {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.send-btn.disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }

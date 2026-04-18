@@ -1,4 +1,4 @@
-import { ref, onUnmounted } from 'vue'
+import { ref } from 'vue'
 import type { Device, SignalMessage } from '../types'
 
 const wsUrl = import.meta.env.DEV
@@ -7,14 +7,16 @@ const wsUrl = import.meta.env.DEV
     ? `wss://${window.location.host}`
     : `ws://${window.location.host}`
 
+// Shared state - all callers use the same WebSocket
+const ws = ref<WebSocket | null>(null)
+const isConnected = ref(false)
+const devices = ref<Device[]>([])
+let localDeviceId = ''
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null
+
 export function useWebSocket() {
-  const ws = ref<WebSocket | null>(null)
-  const isConnected = ref(false)
-  const devices = ref<Device[]>([])
-
-  let heartbeatTimer: ReturnType<typeof setInterval> | null = null
-
   function connect(deviceId: string, deviceName: string) {
+    localDeviceId = deviceId
     ws.value = new WebSocket(wsUrl)
 
     ws.value.onopen = () => {
@@ -38,7 +40,6 @@ export function useWebSocket() {
     ws.value.onclose = () => {
       isConnected.value = false
       if (heartbeatTimer) clearInterval(heartbeatTimer)
-      // Reconnect after 3s
       setTimeout(() => connect(deviceId, deviceName), 3000)
     }
 
@@ -50,7 +51,10 @@ export function useWebSocket() {
   function handleMessage(msg: SignalMessage) {
     switch (msg.type) {
       case 'device-list':
-        devices.value = msg.payload as Device[]
+        devices.value = msg.payload as unknown as Device[]
+        break
+      case 'pong':
+      case 'ping':
         break
       default:
         window.dispatchEvent(new CustomEvent('signal', { detail: msg }))
@@ -62,7 +66,7 @@ export function useWebSocket() {
     if (ws.value?.readyState === WebSocket.OPEN) {
       ws.value.send(JSON.stringify({
         type: 'signal',
-        payload: { from: (window as any).__deviceId, to, data },
+        payload: { from: localDeviceId, to, data },
       }))
     }
   }
@@ -71,14 +75,12 @@ export function useWebSocket() {
     if (ws.value) {
       ws.value.send(JSON.stringify({
         type: 'leave',
-        payload: { id: (window as any).__deviceId },
+        payload: { id: localDeviceId },
       }))
       ws.value.close()
     }
     if (heartbeatTimer) clearInterval(heartbeatTimer)
   }
-
-  onUnmounted(disconnect)
 
   return { ws, isConnected, devices, connect, sendSignal, disconnect }
 }

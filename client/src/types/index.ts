@@ -21,7 +21,6 @@ export interface FileChunk {
 }
 
 export interface TransferState {
-  fileId: string
   fileName: string
   totalSize: number
   transferred: number

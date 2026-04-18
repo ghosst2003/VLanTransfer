@@ -8,7 +8,11 @@
       "Bash(npx vue-tsc *)",
       "Bash(npx vite *)",
       "Bash(node src/index.js)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git remote *)",
+      "Bash(git branch *)",
+      "Bash(git push *)"
     ]
   }
 }

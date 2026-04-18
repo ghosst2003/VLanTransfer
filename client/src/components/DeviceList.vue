@@ -1,13 +1,12 @@
 <script setup lang="ts">
 import type { Device } from '../types'
-import type { Ref } from 'vue'
 import type { PeerState } from '../composables/useWebRTC'
 
 defineProps<{
   devices: Device[]
   currentId: string
   selectedId: string | null
-  peers: Ref<Map<string, PeerState>>
+  peers: Map<string, PeerState>
 }>()
 
 const emit = defineEmits<{

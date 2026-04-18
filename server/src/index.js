@@ -32,6 +32,7 @@ wss.on('connection', (ws) => {
       case 'join': {
         const { id, name } = msg.payload;
         devices.set(id, { ws, info: { id, name } });
+        console.log(`[WS] Device joined: ${name} (${id})`);
         broadcastDeviceList();
         break;
       }
@@ -39,6 +40,7 @@ wss.on('connection', (ws) => {
       case 'leave': {
         const { id } = msg.payload;
         devices.delete(id);
+        console.log(`[WS] Device left: ${id}`);
         broadcastDeviceList();
         break;
       }
@@ -51,6 +53,9 @@ wss.on('connection', (ws) => {
             type: 'signal',
             payload: { from: msg.payload.from, data: signalData },
           }));
+          console.log(`[WS] Signal relayed: ${msg.payload.from} → ${target.info.name} (type: ${signalData?.type})`);
+        } else {
+          console.log(`[WS] Signal FAILED: target ${to} not found or closed`);
         }
         break;
       }

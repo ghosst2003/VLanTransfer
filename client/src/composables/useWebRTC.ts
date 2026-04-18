@@ -1,77 +1,185 @@
-import { ref, onUnmounted } from 'vue'
-import Peer from 'simple-peer'
-import type { Device } from '../types'
-import { useWebSocket } from './useWebSocket'
+import { ref, onUnmounted, type Ref } from 'vue'
+import type { Device, TransferState, SignalMessage } from '../types'
 
 export interface PeerState {
-  peer: InstanceType<typeof Peer>
+  pc: RTCPeerConnection
+  channel: RTCDataChannel | null
   device: Device
   status: 'connecting' | 'connected' | 'error'
+  pendingCandidates: RTCIceCandidateInit[]
 }
 
-export function useWebRTC() {
-  const { devices, sendSignal } = useWebSocket()
+const RTC_CONFIG: RTCConfiguration = {
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+}
+
+export function useWebRTC(
+  devices: Ref<Device[]>,
+  sendSignalFn: (to: string, data: Record<string, unknown>) => void,
+) {
+  const sendSignal = sendSignalFn
   const peers = ref<Map<string, PeerState>>(new Map())
   const messages = ref<Map<string, Array<{ content: string; from: string; timestamp: number }>>>(new Map())
 
   // File transfer state
   const fileBuffers = ref<Map<string, { chunks: ArrayBuffer[]; fileName: string; totalSize: number; totalChunks: number }>>(new Map())
-  const transfers = ref<Map<string, { fileName: string; totalSize: number; transferred: number; progress: number; status: string }>>(new Map())
+  const transfers = ref<Map<string, TransferState>>(new Map())
 
   function createPeer(device: Device) {
-    if (peers.value.has(device.id)) return
+    if (peers.value.has(device.id)) {
+      console.log('[WebRTC] Peer already exists for', device.id)
+      return
+    }
 
-    const peer = new Peer({ initiator: true, trickle: false })
-    const state: PeerState = { peer, device, status: 'connecting' }
+    console.log('[WebRTC] Creating peer for', device.name, device.id)
+    const pc = new RTCPeerConnection(RTC_CONFIG)
+    const channel = pc.createDataChannel('data', { ordered: true })
+    const state: PeerState = { pc, channel, device, status: 'connecting', pendingCandidates: [] }
     peers.value.set(device.id, state)
+    console.log('[WebRTC] Peer created, status:', state.status)
 
-    setupPeerEvents(peer, device)
+    setupDataChannel(channel, device)
+    setupPeerEvents(pc, device)
+
+    // Set up negotiation manually (avoid double-firing with the native onnegotiationneeded)
+    pc.createOffer({ iceRestart: false })
+      .then(async (offer) => {
+        console.log('[WebRTC] Offer created, setting local description')
+        await pc.setLocalDescription(offer)
+        console.log('[WebRTC] Local description set, waiting for ICE gathering')
+        await waitForIceGathering(pc)
+        const bundledSignal = {
+          type: 'offer',
+          sdp: pc.localDescription!.sdp,
+          candidates: state.pendingCandidates,
+        }
+        console.log('[WebRTC] Sending offer with', state.pendingCandidates.length, 'ICE candidates')
+        sendSignal(device.id, bundledSignal)
+      })
+      .catch((err) => {
+        console.error('[WebRTC] Failed to create offer:', err)
+        updatePeerStatus(device.id, 'error')
+      })
   }
 
-  function handleSignal(fromId: string, data: Record<string, unknown>) {
+  async function handleSignal(fromId: string, data: Record<string, unknown>) {
     const device = devices.value.find((d) => d.id === fromId)
-    if (!device) return
+    if (!device) {
+      console.log('[WebRTC] Received signal from unknown device', fromId)
+      return
+    }
+
+    const signalData = data as { type: string; sdp: string; candidates: RTCIceCandidateInit[] }
+    console.log('[WebRTC] handleSignal called, type:', signalData.type, 'from:', fromId)
 
     if (!peers.value.has(fromId)) {
-      const peer = new Peer({ initiator: false, trickle: false })
-      const state: PeerState = { peer, device, status: 'connecting' }
+      console.log('[WebRTC] Creating passive peer for', device.name)
+      const peerConn = new RTCPeerConnection(RTC_CONFIG)
+      const state: PeerState = { pc: peerConn, channel: null, device, status: 'connecting', pendingCandidates: [] }
       peers.value.set(fromId, state)
-      setupPeerEvents(peer, device)
+
+      peerConn.ondatachannel = (e) => {
+        console.log('[WebRTC] Incoming data channel received')
+        state.channel = e.channel
+        setupDataChannel(e.channel, device)
+      }
+      setupPeerEvents(peerConn, device)
     }
 
     const state = peers.value.get(fromId)!
-    if (data.type === 'offer') {
-      state.peer.signal(data)
-    } else if (data.type === 'answer') {
-      state.peer.signal(data)
-    } else if (data.type === 'candidate') {
-      // simple-peer handles ICE internally with trickle: false
+    const peerConn = state.pc
+
+    if (signalData.type === 'offer') {
+      state.pendingCandidates = signalData.candidates || []
+      console.log('[WebRTC] Setting remote description (offer)')
+      await peerConn.setRemoteDescription({ type: 'offer', sdp: signalData.sdp })
+
+      for (const candidate of state.pendingCandidates) {
+        try {
+          await peerConn.addIceCandidate(candidate)
+        } catch {
+          // Ignore invalid candidates
+        }
+      }
+
+      console.log('[WebRTC] Creating answer')
+      const answer = await peerConn.createAnswer()
+      await peerConn.setLocalDescription(answer)
+
+      await waitForIceGathering(peerConn)
+      const bundledSignal = {
+        type: 'answer',
+        sdp: peerConn.localDescription!.sdp,
+        candidates: state.pendingCandidates,
+      }
+      console.log('[WebRTC] Sending answer with', state.pendingCandidates.length, 'ICE candidates')
+      sendSignal(fromId, bundledSignal)
+    } else if (signalData.type === 'answer') {
+      console.log('[WebRTC] Setting remote description (answer)')
+      await peerConn.setRemoteDescription({ type: 'answer', sdp: signalData.sdp })
+
+      const candidates = signalData.candidates || []
+      for (const candidate of candidates) {
+        try {
+          await peerConn.addIceCandidate(candidate)
+        } catch {
+          // Ignore invalid candidates
+        }
+      }
     }
   }
 
-  function setupPeerEvents(peer: InstanceType<typeof Peer>, device: Device) {
-    peer.on('signal', (data) => {
-      sendSignal(device.id, data)
-    })
+  function waitForIceGathering(pc: RTCPeerConnection): Promise<void> {
+    return new Promise((resolve) => {
+      if (pc.iceGatheringState === 'complete') {
+        resolve()
+        return
+      }
 
-    peer.on('connect', () => {
-      const state = peers.value.get(device.id)
-      if (state) state.status = 'connected'
+      const checkState = () => {
+        if (pc.iceGatheringState === 'complete') {
+          pc.removeEventListener('icegatheringstatechange', checkState)
+          resolve()
+        }
+      }
+      pc.addEventListener('icegatheringstatechange', checkState)
+
+      // Timeout after 5 seconds
+      setTimeout(() => {
+        pc.removeEventListener('icegatheringstatechange', checkState)
+        resolve()
+      }, 5000)
+    })
+  }
+
+  // Helper to update peer state reactively
+  function updatePeerStatus(id: string, status: PeerState['status']) {
+    const state = peers.value.get(id)
+    if (state) {
+      peers.value.set(id, { ...state, status })
+    }
+  }
+
+  function setupDataChannel(channel: RTCDataChannel, device: Device) {
+    channel.binaryType = 'arraybuffer'
+
+    channel.onopen = () => {
+      updatePeerStatus(device.id, 'connected')
       if (!messages.value.has(device.id)) {
         messages.value.set(device.id, [])
       }
-    })
+    }
 
-    peer.on('data', (rawData: unknown) => {
+    channel.onmessage = (e) => {
       let data: Record<string, unknown>
       try {
-        if (typeof rawData === 'string') {
-          data = JSON.parse(rawData)
-        } else if (rawData instanceof ArrayBuffer || rawData instanceof Uint8Array) {
-          handleFileChunk(rawData)
+        if (typeof e.data === 'string') {
+          data = JSON.parse(e.data)
+        } else if (e.data instanceof ArrayBuffer) {
+          handleFileChunk(e.data)
           return
         } else {
-          data = rawData as Record<string, unknown>
+          data = e.data as Record<string, unknown>
         }
       } catch {
         return
@@ -93,33 +201,49 @@ export function useWebRTC() {
           totalSize: data.totalSize as number,
           transferred: 0,
           progress: 0,
-          status: 'receiving',
+          status: 'receiving' as const,
         })
       } else if (data.msgType === 'file-chunk') {
         handleFileChunk(data)
       } else if (data.msgType === 'file-end') {
         handleFileComplete(data.fileId as string)
       }
-    })
+    }
 
-    peer.on('error', (err) => {
-      console.error('Peer error:', err)
-      const state = peers.value.get(device.id)
-      if (state) state.status = 'error'
-    })
+    channel.onclose = () => {
+      updatePeerStatus(device.id, 'connecting')
+    }
 
-    peer.on('close', () => {
+    channel.onerror = () => {
+      console.error('[WebRTC] Data channel error')
+      updatePeerStatus(device.id, 'error')
+    }
+  }
+
+  function setupPeerEvents(pc: RTCPeerConnection, device: Device) {
+    pc.onicecandidate = (e) => {
       const state = peers.value.get(device.id)
-      if (state) state.status = 'connecting'
-    })
+      if (state && e.candidate) {
+        state.pendingCandidates.push(e.candidate.toJSON())
+      }
+    }
+
+    pc.onconnectionstatechange = () => {
+      if (!peers.value.has(device.id)) return
+      if (pc.connectionState === 'connected') {
+        updatePeerStatus(device.id, 'connected')
+      } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+        updatePeerStatus(device.id, 'error')
+      }
+    }
   }
 
   function sendMessage(deviceId: string, content: string) {
     const state = peers.value.get(deviceId)
-    if (!state || state.status !== 'connected') return
+    if (!state || state.status !== 'connected' || !state.channel) return
 
     const msg = { msgType: 'text', content, timestamp: Date.now() }
-    state.peer.send(JSON.stringify(msg))
+    state.channel.send(JSON.stringify(msg))
 
     const msgs = messages.value.get(deviceId) || []
     msgs.push({ content, from: 'me', timestamp: Date.now() })
@@ -128,14 +252,15 @@ export function useWebRTC() {
 
   function sendFile(deviceId: string, file: File) {
     const state = peers.value.get(deviceId)
-    if (!state || state.status !== 'connected') return
+    if (!state || state.status !== 'connected' || !state.channel) return
 
+    const channelId = state.channel
     const fileId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
     const CHUNK_SIZE = 16 * 1024
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
 
     // Send file start
-    state.peer.send(JSON.stringify({
+    channelId.send(JSON.stringify({
       msgType: 'file-start',
       fileId,
       fileName: file.name,
@@ -148,7 +273,7 @@ export function useWebRTC() {
       totalSize: file.size,
       transferred: 0,
       progress: 0,
-      status: 'sending',
+      status: 'sending' as const,
     })
 
     // Send chunks
@@ -159,7 +284,7 @@ export function useWebRTC() {
     function readNextChunk() {
       if (offset >= file.size) {
         // All chunks sent
-        state.peer.send(JSON.stringify({
+        channelId.send(JSON.stringify({
           msgType: 'file-end',
           fileId,
         }))
@@ -171,9 +296,8 @@ export function useWebRTC() {
       const slice = file.slice(offset, offset + CHUNK_SIZE)
       reader.onload = () => {
         const buffer = reader.result as ArrayBuffer
-        // Convert to JSON-wrapped base64 for datachannel
         const base64 = arrayBufferToBase64(buffer)
-        state.peer.send(JSON.stringify({
+        channelId.send(JSON.stringify({
           msgType: 'file-chunk',
           fileId,
           chunkIndex,
@@ -197,8 +321,8 @@ export function useWebRTC() {
     readNextChunk()
   }
 
-  function handleFileChunk(data: Record<string, unknown>) {
-    if (typeof data === 'string') return
+  function handleFileChunk(data: ArrayBuffer | Record<string, unknown>) {
+    if (data instanceof ArrayBuffer) return
     const fileId = data.fileId as string
     const buffer = base64ToArrayBuffer(data.data as string)
     const fileBuf = fileBuffers.value.get(fileId)
@@ -216,7 +340,6 @@ export function useWebRTC() {
     const fileBuf = fileBuffers.value.get(fileId)
     if (!fileBuf) return
 
-    // Reassemble file
     const blob = new Blob(fileBuf.chunks)
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -252,7 +375,8 @@ export function useWebRTC() {
 
   onUnmounted(() => {
     for (const state of peers.value.values()) {
-      state.peer.destroy()
+      state.channel?.close()
+      state.pc.close()
     }
     peers.value.clear()
   })
