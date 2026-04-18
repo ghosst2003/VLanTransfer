@@ -1,11 +1,14 @@
 import { ref } from 'vue'
 import type { Device, SignalMessage } from '../types'
 
-const wsUrl = import.meta.env.DEV
-  ? `ws://${window.location.host.replace(/:\d+$/, ':3001')}`
-  : window.location.protocol === 'https:'
-    ? `wss://${window.location.host}`
-    : `ws://${window.location.host}`
+const signalingUrl = import.meta.env.VITE_SIGNALING_URL
+const wsUrl = signalingUrl
+  ? signalingUrl
+  : import.meta.env.DEV
+    ? `ws://${window.location.host.replace(/:\d+$/, ':3001')}`
+    : window.location.protocol === 'https:'
+      ? `wss://${window.location.host}`
+      : `ws://${window.location.host}`
 
 // Shared state - all callers use the same WebSocket
 const ws = ref<WebSocket | null>(null)
