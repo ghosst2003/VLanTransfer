@@ -1,8 +1,9 @@
 <script setup lang="ts">
+import { ref } from 'vue'
 import { formatBytes } from '../utils/file'
 import type { TransferState } from '../types'
 
-defineProps<{
+const props = defineProps<{
   transfers: Map<string, TransferState>
   disabled: boolean
 }>()
@@ -11,12 +12,44 @@ const emit = defineEmits<{
   sendFile: [file: File]
 }>()
 
+const isDragging = ref(false)
+
 function handleFileChange(e: Event) {
   const target = e.target as HTMLInputElement
   const files = target.files
   if (files && files.length > 0) {
     Array.from(files).forEach((file) => emit('sendFile', file))
     target.value = ''
+  }
+}
+
+function handleDragEnter(e: DragEvent) {
+  e.preventDefault()
+  e.stopPropagation()
+  isDragging.value = true
+}
+
+function handleDragLeave(e: DragEvent) {
+  e.preventDefault()
+  e.stopPropagation()
+  if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node)) {
+    isDragging.value = false
+  }
+}
+
+function handleDragOver(e: DragEvent) {
+  e.preventDefault()
+  e.stopPropagation()
+}
+
+function handleDrop(e: DragEvent) {
+  e.preventDefault()
+  e.stopPropagation()
+  isDragging.value = false
+
+  const files = e.dataTransfer?.files
+  if (files && files.length > 0 && !props.disabled) {
+    Array.from(files).forEach((file) => emit('sendFile', file))
   }
 }
 
@@ -28,13 +61,24 @@ function getDirectionLabel(transfer: TransferState): string {
 </script>
 
 <template>
-  <div class="file-transfer">
+  <div class="file-transfer" :class="{ 'drag-over': isDragging }" @dragenter="handleDragEnter" @dragleave="handleDragLeave" @dragover="handleDragOver" @drop="handleDrop">
     <div class="transfer-header">
       <span class="transfer-title">文件传输</span>
       <label class="send-btn" :class="{ disabled }">
         发送文件
         <input type="file" :disabled="disabled" @change="handleFileChange" />
       </label>
+    </div>
+
+    <div v-if="isDragging" class="drop-overlay">
+      <div class="drop-content">
+        <svg class="drop-icon" viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="17 8 12 3 7 8"/>
+          <line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+        <span>拖拽文件到此处即可发送</span>
+      </div>
     </div>
 
     <div class="transfer-list">
@@ -63,6 +107,12 @@ function getDirectionLabel(transfer: TransferState): string {
 .file-transfer {
   border-top: 1px solid var(--border);
   padding: 12px 16px;
+  position: relative;
+}
+
+.file-transfer.drag-over {
+  border-color: var(--primary);
+  background: rgba(37, 99, 235, 0.05);
 }
 
 .transfer-header {
@@ -183,5 +233,32 @@ function getDirectionLabel(transfer: TransferState): string {
   color: var(--text-secondary);
   font-size: 13px;
   padding: 8px 0;
+}
+
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(255, 255, 255, 0.92);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+  border: 2px dashed var(--primary);
+  border-radius: var(--radius);
+}
+
+.drop-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  color: var(--primary);
+  font-size: 16px;
+  font-weight: 500;
+  pointer-events: none;
+}
+
+.drop-icon {
+  opacity: 0.8;
 }
 </style>
