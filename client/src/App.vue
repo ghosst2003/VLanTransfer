@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useDevices } from './composables/useDevices'
 import { useWebSocket } from './composables/useWebSocket'
 import { useWebRTC } from './composables/useWebRTC'
@@ -12,7 +12,7 @@ const deviceId = generateDeviceId()
 const deviceName = getDeviceName()
 
 const { isConnected, devices, connect, sendSignal } = useWebSocket()
-const { peers, messages, transfers, createPeer, handleSignal, sendMessage, sendFile } = useWebRTC(devices, sendSignal)
+const { peers, messages, transfers, createPeer, handleSignal, sendMessage, sendFile } = useWebRTC(devices, sendSignal, deviceId)
 
 const selectedDeviceId = ref<string | null>(null)
 const selectedDevice = computed(() => devices.value.find((d) => d.id === selectedDeviceId.value))
@@ -20,6 +20,14 @@ const selectedPeerStatus = computed(() => {
   if (!selectedDeviceId.value) return null
   const peer = peers.value.get(selectedDeviceId.value)
   return peer?.status ?? null
+})
+
+// When selected device leaves the network, clear selection
+watch(devices, () => {
+  if (selectedDeviceId.value && !selectedDevice.value) {
+    console.log('[App] Selected device disconnected, clearing selection')
+    selectedDeviceId.value = null
+  }
 })
 
 onMounted(() => {

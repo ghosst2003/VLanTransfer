@@ -1,14 +1,14 @@
 import { ref } from 'vue'
 import type { Device, SignalMessage } from '../types'
 
-const signalingUrl = import.meta.env.VITE_SIGNALING_URL
-const wsUrl = signalingUrl
-  ? signalingUrl
-  : import.meta.env.DEV
-    ? `ws://${window.location.host.replace(/:\d+$/, ':3001')}`
-    : window.location.protocol === 'https:'
-      ? `wss://${window.location.host}`
-      : `ws://${window.location.host}`
+const signalingUrl = (window as any).__SIGNALING_URL__
+  || (import.meta.env.VITE_SIGNALING_URL
+    ? import.meta.env.VITE_SIGNALING_URL
+    : import.meta.env.DEV
+      ? `ws://${window.location.host.replace(/:\d+$/, ':3001')}`
+      : import.meta.env.PROD
+        ? `wss://${window.location.host}`
+        : `ws://${window.location.host}`)
 
 // Shared state - all callers use the same WebSocket
 const ws = ref<WebSocket | null>(null)
@@ -20,7 +20,7 @@ let heartbeatTimer: ReturnType<typeof setInterval> | null = null
 export function useWebSocket() {
   function connect(deviceId: string, deviceName: string) {
     localDeviceId = deviceId
-    ws.value = new WebSocket(wsUrl)
+    ws.value = new WebSocket(signalingUrl)
 
     ws.value.onopen = () => {
       isConnected.value = true

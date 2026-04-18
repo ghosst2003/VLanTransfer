@@ -13,7 +13,12 @@
       "Bash(git remote *)",
       "Bash(git branch *)",
       "Bash(git push *)",
-      "Bash(npm run *)"
+      "Bash(npm run *)",
+      "Bash(./node_modules/.bin/vue-tsc *)",
+      "Bash(npx playwright *)",
+      "Bash(lsof -ti:3001)",
+      "Bash(xargs kill *)",
+      "Bash(lsof -ti:3002)"
     ]
   }
 }

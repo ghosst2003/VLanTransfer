@@ -1,4 +1,4 @@
-import { ref, onUnmounted, type Ref } from 'vue'
+import { ref, onUnmounted, watch, type Ref } from 'vue'
 import type { Device, TransferState } from '../types'
 
 export interface PeerState {
@@ -8,6 +8,10 @@ export interface PeerState {
   status: 'connecting' | 'connected' | 'error'
   pendingCandidates: RTCIceCandidateInit[]
   hadConnection: boolean
+  // True if this peer initiated the connection (called createPeer first).
+  // Only the initiator should drive renegotiation — the responder must not
+  // create new offers after answering, otherwise it triggers an infinite loop.
+  isInitiator: boolean
 }
 
 const RTC_CONFIG: RTCConfiguration = {
@@ -17,6 +21,7 @@ const RTC_CONFIG: RTCConfiguration = {
 export function useWebRTC(
   devices: Ref<Device[]>,
   sendSignalFn: (to: string, data: Record<string, unknown>) => void,
+  localId = '',
 ) {
   const sendSignal = sendSignalFn
   const peers = ref<Map<string, PeerState>>(new Map())
@@ -32,22 +37,50 @@ export function useWebRTC(
   // Track per-peer channel recreation promises
   const channelRecreating = new Map<string, Promise<boolean>>()
 
-  function createPeer(device: Device) {
-    if (peers.value.has(device.id)) {
-      console.log('[WebRTC] Peer already exists for', device.id)
-      return
-    }
+  // Track per-peer renegotiation in-progress to prevent glare
+  const renegotiating = new Set<string>()
+
+  // Cooldown timers to prevent spurious renegotiation during initial connection setup
+  const renegotiationCooldowns = new Map<string, ReturnType<typeof setTimeout>>()
+
+  // Non-reactive channel store to avoid Vue reactivity issues
+  const channels = new Map<string, RTCDataChannel>()
+
+  function getOrCreatePeer(device: Device): PeerState {
+    const existing = peers.value.get(device.id)
+    if (existing) return existing
 
     const pc = new RTCPeerConnection(RTC_CONFIG)
-    const state: PeerState = { pc, channel: null, device, status: 'connecting', pendingCandidates: [], hadConnection: false }
+    // Determine initiator by device ID: lower ID initiates to avoid race.
+    const isInitiator = localId !== '' ? device.id < localId : true
+    const state: PeerState = {
+      pc, channel: null, device, status: 'connecting',
+      pendingCandidates: [], hadConnection: false, isInitiator,
+    }
     peers.value.set(device.id, state)
 
-    // Set up handlers BEFORE createDataChannel so onnegotiationneeded is caught
+    // Set up handlers BEFORE creating data channel
     setupPeerEvents(pc, device)
 
-    const channel = pc.createDataChannel('data', { ordered: true })
-    state.channel = channel
-    setupDataChannel(channel, device)
+    // Set up listener for incoming data channel
+    pc.ondatachannel = (e) => {
+      console.log('[WebRTC] Incoming data channel for', device.id)
+      const old = channels.get(device.id)
+      if (old && old.readyState !== 'closed') old.close()
+      channels.set(device.id, e.channel)
+      state.channel = e.channel
+      setupDataChannel(e.channel, device)
+    }
+
+    // Only the initiator creates the data channel and sends the offer.
+    if (isInitiator) {
+      const channel = pc.createDataChannel('data', { ordered: true })
+      channels.set(device.id, channel)
+      state.channel = channel
+      setupDataChannel(channel, device)
+    }
+
+    return state
   }
 
   async function handleSignal(fromId: string, data: Record<string, unknown>) {
@@ -58,23 +91,12 @@ export function useWebRTC(
     }
 
     const signalData = data as { type: string; sdp: string; candidates: RTCIceCandidateInit[] }
-    console.log('[WebRTC] handleSignal called, type:', signalData.type, 'from:', fromId)
+    console.log('[WebRTC] handleSignal type:', signalData.type, 'from:', fromId)
 
-    if (!peers.value.has(fromId)) {
-      console.log('[WebRTC] Creating passive peer for', device.name)
-      const peerConn = new RTCPeerConnection(RTC_CONFIG)
-      const state: PeerState = { pc: peerConn, channel: null, device, status: 'connecting', pendingCandidates: [], hadConnection: false }
-      peers.value.set(fromId, state)
-
-      peerConn.ondatachannel = (e) => {
-        console.log('[WebRTC] Incoming data channel received')
-        state.channel = e.channel
-        setupDataChannel(e.channel, device)
-      }
-      setupPeerEvents(peerConn, device)
-    }
-
-    const state = peers.value.get(fromId)!
+    // Use the shared peer state — getOrCreatePeer returns existing if present.
+    // Both getOrCreatePeer and handleSignal use the same isInitiator logic,
+    // so they agree on whether this peer is active (initiator) or passive.
+    const state = getOrCreatePeer(device)
     const peerConn = state.pc
 
     if (signalData.type === 'offer') {
@@ -82,12 +104,25 @@ export function useWebRTC(
       if (peerConn.signalingState === 'have-local-offer') {
         console.log('[WebRTC] Glare detected, rolling back local offer')
         await peerConn.setLocalDescription({ type: 'rollback' })
+        // Rollback destroys the local data channel. Clear the reference so
+        // ondatachannel can set the remote's channel instead.
+        channels.delete(fromId)
+        state.channel = null
       }
+
+      // Do NOT create a data channel here. The remote's offer includes their
+      // data channel, which will arrive via ondatachannel.
+
       const remoteCandidates = signalData.candidates || []
       console.log('[WebRTC] Setting remote description (offer) with', remoteCandidates.length, 'candidates')
-      await peerConn.setRemoteDescription({ type: 'offer', sdp: signalData.sdp })
+      try {
+        await peerConn.setRemoteDescription({ type: 'offer', sdp: signalData.sdp })
+      } catch (err) {
+        console.log('[WebRTC] Failed to set remote offer, signaling state:', peerConn.signalingState, err)
+        return
+      }
 
-      // Clear stale candidates, then add the ones from this offer
+      // Clear stale candidates, then add the ones bundled in this offer
       state.pendingCandidates = []
       for (const candidate of remoteCandidates) {
         try {
@@ -109,9 +144,24 @@ export function useWebRTC(
       }
       console.log('[WebRTC] Sending answer with', state.pendingCandidates.length, 'ICE candidates')
       sendSignal(fromId, bundledSignal)
+
+      // Set cooldown to prevent spurious renegotiation after initial negotiation
+      renegotiationCooldowns.set(fromId, setTimeout(() => renegotiationCooldowns.delete(fromId), 10000))
     } else if (signalData.type === 'answer') {
+      // Ignore stale answers when not in have-local-offer state.
+      // This happens when there are other browser tabs connected to the
+      // same signaling server sending stale messages.
+      if (peerConn.signalingState !== 'have-local-offer') {
+        console.log('[WebRTC] Ignoring answer — signaling state:', peerConn.signalingState)
+        return
+      }
       console.log('[WebRTC] Setting remote description (answer)')
-      await peerConn.setRemoteDescription({ type: 'answer', sdp: signalData.sdp })
+      try {
+        await peerConn.setRemoteDescription({ type: 'answer', sdp: signalData.sdp })
+      } catch (err) {
+        console.log('[WebRTC] Failed to set remote answer:', err)
+        return
+      }
 
       const candidates = signalData.candidates || []
       for (const candidate of candidates) {
@@ -121,8 +171,10 @@ export function useWebRTC(
           // Ignore invalid candidates
         }
       }
-      // Clear candidates after negotiation is done
       state.pendingCandidates = []
+
+      // Set cooldown to prevent spurious renegotiation after initial negotiation
+      renegotiationCooldowns.set(fromId, setTimeout(() => renegotiationCooldowns.delete(fromId), 10000))
     }
   }
 
@@ -141,7 +193,6 @@ export function useWebRTC(
       }
       pc.addEventListener('icegatheringstatechange', checkState)
 
-      // Timeout after 5 seconds
       setTimeout(() => {
         pc.removeEventListener('icegatheringstatechange', checkState)
         resolve()
@@ -149,7 +200,6 @@ export function useWebRTC(
     })
   }
 
-  // Helper to update peer state reactively
   function updatePeerStatus(id: string, status: PeerState['status']) {
     const state = peers.value.get(id)
     if (state) {
@@ -161,6 +211,7 @@ export function useWebRTC(
     channel.binaryType = 'arraybuffer'
 
     channel.onopen = () => {
+      console.log('[WebRTC] Data channel OPEN for', device.id, 'negotiated:', channel.negotiated, 'id:', channel.id)
       updatePeerStatus(device.id, 'connected')
       if (!messages.value.has(device.id)) {
         messages.value.set(device.id, [])
@@ -168,8 +219,8 @@ export function useWebRTC(
     }
 
     channel.onmessage = (e) => {
+      console.log('[WebRTC] Message received from', device.id, 'type:', e.data instanceof ArrayBuffer ? 'binary' : 'text')
       if (e.data instanceof ArrayBuffer) {
-        // Binary file chunk
         if (currentReceiveFile && currentReceiveFileId) {
           currentReceiveFile.chunks.push(e.data)
           const transferred = currentReceiveFile.chunks.reduce((sum, c) => sum + c.byteLength, 0)
@@ -182,38 +233,39 @@ export function useWebRTC(
         return
       }
 
-      let data: Record<string, unknown>
+      let msg: Record<string, unknown>
       try {
-        data = JSON.parse(e.data)
+        msg = JSON.parse(e.data)
       } catch {
         return
       }
 
-      if (data.msgType === 'text') {
+      if (msg.msgType === 'text') {
         const msgs = messages.value.get(device.id) || []
-        msgs.push({ content: data.content as string, from: device.id, timestamp: data.timestamp as number })
+        msgs.push({ content: msg.content as string, from: device.id, timestamp: msg.timestamp as number })
         messages.value.set(device.id, msgs)
-      } else if (data.msgType === 'file-start') {
-        currentReceiveFileId = data.fileId as string
+      } else if (msg.msgType === 'file-start') {
+        currentReceiveFileId = msg.fileId as string
         currentReceiveFile = {
           chunks: [],
-          fileName: data.fileName as string,
-          totalSize: data.totalSize as number,
+          fileName: msg.fileName as string,
+          totalSize: msg.totalSize as number,
         }
-        transfers.value.set(data.fileId as string, {
-          fileName: data.fileName as string,
-          totalSize: data.totalSize as number,
+        transfers.value.set(msg.fileId as string, {
+          fileName: msg.fileName as string,
+          totalSize: msg.totalSize as number,
           transferred: 0,
           progress: 0,
-          status: 'receiving' as const,
-          direction: 'in' as const,
+          status: 'receiving',
+          direction: 'in',
         })
-      } else if (data.msgType === 'file-end') {
-        handleFileComplete(data.fileId as string)
+      } else if (msg.msgType === 'file-end') {
+        handleFileComplete(msg.fileId as string)
       }
     }
 
     channel.onclose = () => {
+      channels.delete(device.id)
       const s = peers.value.get(device.id)
       if (s) {
         s.channel = null
@@ -228,9 +280,6 @@ export function useWebRTC(
     }
   }
 
-  // Track per-peer renegotiation in-progress to prevent glare
-  const renegotiating = new Set<string>()
-
   function setupPeerEvents(pc: RTCPeerConnection, device: Device) {
     pc.onicecandidate = (e) => {
       const state = peers.value.get(device.id)
@@ -240,26 +289,56 @@ export function useWebRTC(
     }
 
     pc.onnegotiationneeded = async () => {
-      if (pc.signalingState !== 'stable') return
-      if (renegotiating.has(device.id)) return
+      console.log('[WebRTC] onnegotiationneeded fired for', device.id, 'state:', pc.signalingState)
+      // Block during active renegotiation
+      if (renegotiating.has(device.id)) {
+        console.log('[WebRTC] Skipping — already renegotiating')
+        return
+      }
+      // Block when signaling is not stable
+      if (pc.signalingState !== 'stable') {
+        console.log('[WebRTC] Skipping — signaling state:', pc.signalingState)
+        return
+      }
+      // Block during cooldown (prevents spurious renegotiation after initial setup)
+      if (renegotiationCooldowns.has(device.id)) {
+        console.log('[WebRTC] Skipping renegotiation — in cooldown')
+        return
+      }
+
       const state = peers.value.get(device.id)
       if (!state) return
 
+      // The responder (passive peer) must NEVER drive renegotiation.
+      // After answering the initial offer, renegotiation on the responder
+      // side creates new offers that trigger an infinite answer/offer loop,
+      // breaking the data channel.
+      if (!state.isInitiator) {
+        console.log('[WebRTC] Skipping renegotiation on responder peer')
+        return
+      }
+
+      // Block while sending a file to avoid disrupting the data channel
+      const hasActiveSend = [...transfers.value.values()].some(
+        (t) => t.status === 'sending' && t.direction === 'out',
+      )
+      if (hasActiveSend) {
+        console.log('[WebRTC] Skipping renegotiation — file transfer in progress')
+        return
+      }
+
       renegotiating.add(device.id)
-      // Clear stale candidates from previous negotiations
       state.pendingCandidates = []
       console.log('[WebRTC] Renegotiation needed for', device.id)
       try {
         const offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
         await waitForIceGathering(pc)
-        const bundledSignal = {
+        sendSignal(device.id, {
           type: 'offer',
           sdp: pc.localDescription!.sdp,
           candidates: state.pendingCandidates,
-        }
-        console.log('[WebRTC] Sending renegotiation offer with', state.pendingCandidates.length, 'ICE candidates')
-        sendSignal(device.id, bundledSignal)
+        })
         state.pendingCandidates = []
       } catch (err) {
         console.error('[WebRTC] Renegotiation failed:', err)
@@ -285,10 +364,16 @@ export function useWebRTC(
 
   function sendMessage(deviceId: string, content: string) {
     const state = peers.value.get(deviceId)
-    if (!state || state.status !== 'connected' || !state.channel || state.channel.readyState !== 'open') return
+    const channel = channels.get(deviceId)
+    console.log('[WebRTC] sendMessage to', deviceId,
+      'peerExists:', !!state,
+      'channel:', !!channel,
+      'readyState:', channel?.readyState,
+      'status:', state?.status)
+    if (!state || state.status !== 'connected' || !channel || channel.readyState !== 'open') return
 
     const msg = { msgType: 'text', content, timestamp: Date.now() }
-    state.channel.send(JSON.stringify(msg))
+    channel.send(JSON.stringify(msg))
 
     const msgs = messages.value.get(deviceId) || []
     msgs.push({ content, from: 'me', timestamp: Date.now() })
@@ -297,33 +382,33 @@ export function useWebRTC(
 
   function sendFile(deviceId: string, file: File) {
     const state = peers.value.get(deviceId)
+    const channel = channels.get(deviceId)
+    console.log('[WebRTC] sendFile to', deviceId, 'channel:', !!channel, 'readyState:', channel?.readyState, 'status:', state?.status)
     if (!state) return
 
-    // If channel is open, send directly
-    if (state.channel && state.channel.readyState === 'open') {
+    if (channel && channel.readyState === 'open') {
       _doSendFile(deviceId, file)
       return
     }
 
-    // If already recreating, wait for it then send
+    // Recreate channel if needed
     let recreatePromise = channelRecreating.get(deviceId)
     if (!recreatePromise) {
-      // Start recreation
       recreatePromise = (async () => {
         try {
-          state.channel = state.pc.createDataChannel('data', { ordered: true })
-          setupDataChannel(state.channel, state.device)
-          // Wait for channel to open (up to 10s)
+          const newChannel = state.pc.createDataChannel('data', { ordered: true })
+          channels.set(deviceId, newChannel)
+          setupDataChannel(newChannel, state.device)
           return new Promise<boolean>((resolve) => {
             const timeout = setTimeout(() => {
-              state.channel?.removeEventListener('open', onOpen)
+              newChannel.removeEventListener('open', onOpen)
               resolve(false)
             }, 10000)
             const onOpen = () => {
               clearTimeout(timeout)
               resolve(true)
             }
-            state.channel!.addEventListener('open', onOpen)
+            newChannel.addEventListener('open', onOpen)
           })
         } catch {
           return false
@@ -334,28 +419,24 @@ export function useWebRTC(
       channelRecreating.set(deviceId, recreatePromise)
     }
 
-    // Wait for channel then send
     recreatePromise.then((ok) => {
       if (!ok) return
-      const freshState = peers.value.get(deviceId)
-      if (freshState?.channel?.readyState === 'open') {
+      const freshChannel = channels.get(deviceId)
+      if (freshChannel?.readyState === 'open') {
         _doSendFile(deviceId, file)
       }
     })
   }
 
   function _doSendFile(deviceId: string, file: File) {
-    const state = peers.value.get(deviceId)
-    if (!state || !state.channel || state.channel.readyState !== 'open') return
-
-    const channelId = state.channel
+    const channel = channels.get(deviceId)
+    if (!channel || channel.readyState !== 'open') return
     const fileId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
     const CHUNK_SIZE = 16 * 1024
     const BUFFER_THRESHOLD = 256 * 1024
     const DRAIN_CHECK_MS = 10
 
-    // Send file start as JSON
-    channelId.send(JSON.stringify({
+    channel.send(JSON.stringify({
       msgType: 'file-start',
       fileId,
       fileName: file.name,
@@ -368,15 +449,15 @@ export function useWebRTC(
       totalSize: file.size,
       transferred: 0,
       progress: 0,
-      status: 'sending' as const,
-      direction: 'out' as const,
+      status: 'sending',
+      direction: 'out',
     })
 
     let offset = 0
 
     function waitForDrain(fn: () => void) {
-      if (channelId.readyState !== 'open') return
-      if (channelId.bufferedAmount <= BUFFER_THRESHOLD) {
+      if (channel.readyState !== 'open') return
+      if (channel.bufferedAmount <= BUFFER_THRESHOLD) {
         fn()
       } else {
         setTimeout(() => waitForDrain(fn), DRAIN_CHECK_MS)
@@ -386,11 +467,8 @@ export function useWebRTC(
     function sendNextChunk() {
       if (offset >= file.size) {
         waitForDrain(() => {
-          if (channelId.readyState === 'open') {
-            channelId.send(JSON.stringify({
-              msgType: 'file-end',
-              fileId,
-            }))
+          if (channel.readyState === 'open') {
+            channel.send(JSON.stringify({ msgType: 'file-end', fileId }))
           }
           const transfer = transfers.value.get(fileId)
           if (transfer) transfer.status = 'done'
@@ -400,9 +478,8 @@ export function useWebRTC(
 
       const slice = file.slice(offset, offset + CHUNK_SIZE)
       slice.arrayBuffer().then((buffer) => {
-        if (channelId.readyState !== 'open') return
-        // Send binary chunk directly (no base64 overhead)
-        channelId.send(buffer)
+        if (channel.readyState !== 'open') return
+        channel.send(buffer)
         offset += CHUNK_SIZE
 
         const transfer = transfers.value.get(fileId)
@@ -435,20 +512,45 @@ export function useWebRTC(
     const transfer = transfers.value.get(fileId)
     if (transfer) transfer.status = 'done'
 
-    // Reset receive state
     currentReceiveFile = null
     currentReceiveFileId = null
   }
 
+  function removePeer(deviceId: string) {
+    const state = peers.value.get(deviceId)
+    if (!state) return
+    const ch = channels.get(deviceId)
+    ch?.close()
+    state.pc.close()
+    peers.value.delete(deviceId)
+    channels.delete(deviceId)
+    channelRecreating.delete(deviceId)
+    renegotiating.delete(deviceId)
+    messages.value.delete(deviceId)
+  }
+
+  watch(
+    devices,
+    (currentDevices) => {
+      const knownIds = new Set(currentDevices.map((d) => d.id))
+      for (const peerId of peers.value.keys()) {
+        if (!knownIds.has(peerId)) {
+          console.log('[WebRTC] Peer device left, cleaning up:', peerId)
+          removePeer(peerId)
+        }
+      }
+    },
+    { deep: true },
+  )
+
   onUnmounted(() => {
-    for (const state of peers.value.values()) {
-      state.channel?.close()
-      state.pc.close()
-    }
+    for (const ch of channels.values()) ch.close()
+    for (const state of peers.value.values()) state.pc.close()
     peers.value.clear()
+    channels.clear()
     channelRecreating.clear()
     renegotiating.clear()
   })
 
-  return { peers, messages, transfers, createPeer, handleSignal, sendMessage, sendFile }
+  return { peers, messages, transfers, createPeer: getOrCreatePeer, handleSignal, sendMessage, sendFile, removePeer }
 }
