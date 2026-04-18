@@ -258,6 +258,10 @@ export function useWebRTC(
     const fileId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
     const CHUNK_SIZE = 16 * 1024
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
+    // Max buffered bytes before pausing (256KB)
+    const BUFFER_THRESHOLD = 256 * 1024
+    // How often to re-check bufferedAmount when full (10ms)
+    const DRAIN_CHECK_MS = 10
 
     // Send file start
     channelId.send(JSON.stringify({
@@ -281,15 +285,25 @@ export function useWebRTC(
     let chunkIndex = 0
     const reader = new FileReader()
 
+    function waitForDrain(fn: () => void) {
+      if (channelId.bufferedAmount <= BUFFER_THRESHOLD) {
+        fn()
+      } else {
+        setTimeout(() => waitForDrain(fn), DRAIN_CHECK_MS)
+      }
+    }
+
     function readNextChunk() {
       if (offset >= file.size) {
-        // All chunks sent
-        channelId.send(JSON.stringify({
-          msgType: 'file-end',
-          fileId,
-        }))
-        const transfer = transfers.value.get(fileId)
-        if (transfer) transfer.status = 'done'
+        // Wait for buffer to drain before sending file-end
+        waitForDrain(() => {
+          channelId.send(JSON.stringify({
+            msgType: 'file-end',
+            fileId,
+          }))
+          const transfer = transfers.value.get(fileId)
+          if (transfer) transfer.status = 'done'
+        })
         return
       }
 
@@ -297,23 +311,28 @@ export function useWebRTC(
       reader.onload = () => {
         const buffer = reader.result as ArrayBuffer
         const base64 = arrayBufferToBase64(buffer)
-        channelId.send(JSON.stringify({
+        const msg = JSON.stringify({
           msgType: 'file-chunk',
           fileId,
           chunkIndex,
           totalChunks,
           data: base64,
-        }))
-        chunkIndex++
-        offset += CHUNK_SIZE
+        })
+        // Wait for buffer to drain before sending next chunk
+        waitForDrain(() => {
+          if (channelId.readyState !== 'open') return
+          channelId.send(msg)
+          chunkIndex++
+          offset += CHUNK_SIZE
 
-        const transfer = transfers.value.get(fileId)
-        if (transfer) {
-          transfer.transferred = offset
-          transfer.progress = Math.round((offset / file.size) * 100)
-        }
+          const transfer = transfers.value.get(fileId)
+          if (transfer) {
+            transfer.transferred = offset
+            transfer.progress = Math.round((offset / file.size) * 100)
+          }
 
-        readNextChunk()
+          readNextChunk()
+        })
       }
       reader.readAsArrayBuffer(slice)
     }
